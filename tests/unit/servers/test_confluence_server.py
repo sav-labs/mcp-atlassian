@@ -963,3 +963,38 @@ async def test_get_page_images_fetch_failure(client, mock_confluence_fetcher):
     summary = json.loads(response.content[0].text)
     assert summary["downloaded"] == 0
     assert len(summary["failed"]) == 1
+
+
+@pytest.mark.anyio
+async def test_get_page_images_filenames_filter(client, mock_confluence_fetcher):
+    """Only the requested page images are downloaded."""
+    mock_confluence_fetcher.get_content_attachments.return_value = {
+        "success": True,
+        "content_id": "123",
+        "attachments": [
+            {
+                "id": f"att{i}",
+                "title": f"diagram-{i}.png",
+                "type": "attachment",
+                "extensions": {"mediaType": "image/png", "fileSize": 1024},
+                "_links": {"download": f"/download/attachments/123/diagram-{i}.png"},
+            }
+            for i in range(1, 4)
+        ],
+        "total": 3,
+        "start": 0,
+        "limit": 50,
+    }
+    mock_confluence_fetcher.fetch_attachment_content.return_value = b"\x89PNG"
+
+    response = await client.call_tool(
+        "confluence_get_page_images",
+        {"content_id": "123", "filenames": "diagram-2.png"},
+    )
+
+    summary = json.loads(response.content[0].text)
+    assert summary["total_images"] == 3
+    assert summary["downloaded"] == 1
+    assert "not_found" not in summary
+    assert len(response.content) == 2
+    assert mock_confluence_fetcher.fetch_attachment_content.call_count == 1

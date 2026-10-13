@@ -220,3 +220,22 @@ class TestFetchAndEncodeAttachment:
         assert encoded is None
         assert mime is None
         assert size == 150
+
+
+def test_parse_filenames():
+    from mcp_atlassian.utils.media import parse_filenames
+
+    assert parse_filenames(None) is None
+    assert parse_filenames("") is None
+    assert parse_filenames(" , ") is None
+    assert parse_filenames("a.png, b.png ,") == ["a.png", "b.png"]
+
+
+def test_select_by_filenames():
+    from mcp_atlassian.utils.media import select_by_filenames
+
+    items = [("A.png", "image/png"), ("b.png", "image/png")]
+    assert select_by_filenames(items, lambda x: x, None) == (items, [])
+    selected, missing = select_by_filenames(items, lambda x: x, ["a.PNG", "c.png"])
+    assert selected == [("A.png", "image/png")]
+    assert missing == ["c.png"]

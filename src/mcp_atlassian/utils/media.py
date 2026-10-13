@@ -4,6 +4,7 @@ import base64
 import logging
 import mimetypes
 from collections.abc import Callable
+from typing import TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +22,8 @@ _IMAGE_MIME_TYPES = frozenset(
         "image/bmp",
     }
 )
+
+_T = TypeVar("_T")
 
 _AMBIGUOUS_MIME_TYPES = frozenset({"application/octet-stream", "application/binary"})
 
@@ -126,3 +129,48 @@ def fetch_and_encode_attachment(
         mime_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
 
     return encoded, mime_type, actual_size
+
+
+def parse_filenames(filenames: str | None) -> list[str] | None:
+    """Parse a comma-separated filename filter.
+
+    Args:
+        filenames: Comma-separated attachment filenames, or None.
+
+    Returns:
+        List of stripped, non-empty names, or None when no filter was given.
+    """
+    if not filenames:
+        return None
+    names = [name.strip() for name in filenames.split(",") if name.strip()]
+    return names or None
+
+
+def select_by_filenames(
+    items: list[tuple[_T, str]],
+    get_name: Callable[[_T], str | None],
+    wanted: list[str] | None,
+) -> tuple[list[tuple[_T, str]], list[str]]:
+    """Keep only image attachments whose filename is in *wanted*.
+
+    Matching is case-insensitive. Without a filter all items are kept.
+
+    Args:
+        items: (attachment, resolved_mime) pairs.
+        get_name: Returns the filename of an attachment.
+        wanted: Requested filenames, or None for no filtering.
+
+    Returns:
+        Tuple of (selected items, requested names that matched nothing).
+    """
+    if wanted is None:
+        return items, []
+    wanted_lower = {name.lower() for name in wanted}
+    selected = [
+        (att, mime)
+        for att, mime in items
+        if (get_name(att) or "").lower() in wanted_lower
+    ]
+    found = {(get_name(att) or "").lower() for att, _ in selected}
+    not_found = [name for name in wanted if name.lower() not in found]
+    return selected, not_found

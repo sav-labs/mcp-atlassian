@@ -21,6 +21,8 @@ from mcp_atlassian.utils.media import (
     ATTACHMENT_MAX_BYTES,
     fetch_and_encode_attachment,
     is_image_attachment,
+    parse_filenames,
+    select_by_filenames,
 )
 
 logger = logging.getLogger(__name__)
@@ -921,8 +923,19 @@ async def get_issue_images(
             pattern=ISSUE_KEY_PATTERN,
         ),
     ],
+    filenames: Annotated[
+        str | None,
+        Field(
+            description=(
+                "(Optional) Comma-separated image filenames to download "
+                "(e.g., 'screenshot-29.png,image-2026-10-13.png'). "
+                "Case-insensitive exact match. Omit to download all images. "
+                "Get names via jira_get_issue with fields='attachment'."
+            ),
+        ),
+    ] = None,
 ) -> list[TextContent | ImageContent]:
-    """Get all images attached to a Jira issue as inline image content.
+    """Get images attached to a Jira issue as inline image content.
 
     Filters attachments to images only (PNG, JPEG, GIF, WebP, SVG, BMP)
     and returns them as base64-encoded ImageContent that clients can
@@ -932,9 +945,14 @@ async def get_issue_images(
     detected by filename extension as a fallback. Images larger than
     50 MB are skipped with an error entry in the summary.
 
+    With ``filenames`` only the named images are downloaded. Requested
+    names that match nothing are listed in ``not_found`` together with
+    ``available`` image names (newest first) so the caller can retry.
+
     Args:
         ctx: The FastMCP context.
         issue_key: Jira issue key.
+        filenames: Optional comma-separated filename filter.
 
     Returns:
         A list with a text summary followed by one ImageContent per
@@ -972,10 +990,14 @@ async def get_issue_images(
         )
         return contents
 
+    selected, not_found = select_by_filenames(
+        image_attachments, lambda a: a.filename, parse_filenames(filenames)
+    )
+
     fetched: list[dict[str, object]] = []
     failed: list[dict[str, object]] = []
 
-    for att, resolved_mime in image_attachments:
+    for att, resolved_mime in selected:
         filename = att.filename or "unknown"
 
         if att.size > ATTACHMENT_MAX_BYTES:
@@ -1027,6 +1049,14 @@ async def get_issue_images(
         "downloaded": len(fetched),
         "failed": failed,
     }
+    if not_found:
+        summary["not_found"] = not_found
+        summary["available"] = [
+            {"filename": att.filename, "created": att.created}
+            for att, _ in sorted(
+                image_attachments, key=lambda item: item[0].created, reverse=True
+            )
+        ]
     contents.insert(
         0,
         TextContent(

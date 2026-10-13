@@ -20,6 +20,8 @@ from mcp_atlassian.utils.media import (
     ATTACHMENT_MAX_BYTES,
     fetch_and_encode_attachment,
     is_image_attachment,
+    parse_filenames,
+    select_by_filenames,
 )
 from mcp_atlassian.utils.urls import resolve_relative_url
 
@@ -1634,6 +1636,11 @@ async def download_attachment(
             or mimetypes.guess_type(filename)[0]
             or "application/octet-stream"
         )
+        # Images stored as application/octet-stream would reach clients as
+        # opaque binary blobs; resolve the real image MIME by extension.
+        is_img, resolved_mime = is_image_attachment(mime_type, filename)
+        if is_img:
+            mime_type = resolved_mime
         file_size = attachment_data.get("extensions", {}).get("fileSize")
 
         if file_size is not None and file_size > ATTACHMENT_MAX_BYTES:
@@ -1933,8 +1940,19 @@ async def get_page_images(
             )
         ),
     ],
+    filenames: Annotated[
+        str | None,
+        Field(
+            description=(
+                "(Optional) Comma-separated image filenames to download "
+                "(e.g., 'diagram.png,screenshot.jpg'). Case-insensitive "
+                "exact match. Omit to download all images. Get names via "
+                "confluence_get_attachments."
+            ),
+        ),
+    ] = None,
 ) -> list[TextContent | ImageContent]:
-    """Get all images attached to a Confluence page as inline image content.
+    """Get images attached to a Confluence page as inline image content.
 
     Filters attachments to images only (PNG, JPEG, GIF, WebP, SVG, BMP)
     and returns them as base64-encoded ImageContent that clients can
@@ -1944,9 +1962,14 @@ async def get_page_images(
     detected by filename extension as a fallback. Images larger than
     50 MB are skipped with an error entry in the summary.
 
+    With ``filenames`` only the named images are downloaded. Requested
+    names that match nothing are listed in ``not_found`` together with
+    ``available`` image names so the caller can retry.
+
     Args:
         ctx: The FastMCP context.
         content_id: The ID of the content.
+        filenames: Optional comma-separated filename filter.
 
     Returns:
         A list with a text summary followed by one ImageContent per
@@ -2001,10 +2024,16 @@ async def get_page_images(
         )
         return contents
 
+    selected, not_found = select_by_filenames(
+        image_attachments,
+        lambda a: a.get("title") if isinstance(a.get("title"), str) else None,
+        parse_filenames(filenames),
+    )
+
     fetched: list[dict[str, object]] = []
     failed: list[dict[str, object]] = []
 
-    for att_dict, resolved_mime in image_attachments:
+    for att_dict, resolved_mime in selected:
         attachment = ConfluenceAttachment.from_api_response(att_dict)
         filename = attachment.title or "unknown"
 
@@ -2063,6 +2092,9 @@ async def get_page_images(
         "downloaded": len(fetched),
         "failed": failed,
     }
+    if not_found:
+        summary["not_found"] = not_found
+        summary["available"] = [att.get("title") for att, _ in image_attachments]
     contents.insert(
         0,
         TextContent(

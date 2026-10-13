@@ -2430,3 +2430,42 @@ async def test_get_field_options_combined(jira_client, mock_jira_fetcher):
     # return_limit=1 caps to first match
     assert len(result) == 1
     assert result[0] == "High"
+
+
+@pytest.mark.anyio
+async def test_get_issue_images_filenames_filter(jira_client, mock_jira_fetcher):
+    """Only the requested images are downloaded; unknown names are reported."""
+    from mcp_atlassian.models.jira import JiraAttachment
+
+    mock_jira_fetcher.get_issue_attachments.return_value = [
+        JiraAttachment(
+            id=str(i),
+            filename=f"screenshot-{i}.png",
+            size=1024,
+            content_type="image/png",
+            created=f"2026-10-1{i}T10:00:00.000+0300",
+            url=f"https://jira.example.com/att/{i}",
+        )
+        for i in range(1, 4)
+    ]
+    mock_jira_fetcher.fetch_attachment_content.return_value = b"\x89PNG"
+
+    response = await jira_client.call_tool(
+        "jira_get_issue_images",
+        {"issue_key": "TEST-123", "filenames": "Screenshot-3.png, missing.png"},
+    )
+
+    summary = json.loads(response.content[0].text)
+    assert summary["total_images"] == 3
+    assert summary["downloaded"] == 1
+    assert summary["not_found"] == ["missing.png"]
+    assert [a["filename"] for a in summary["available"]] == [
+        "screenshot-3.png",
+        "screenshot-2.png",
+        "screenshot-1.png",
+    ]
+    assert len(response.content) == 2
+    assert response.content[1].type == "image"
+    mock_jira_fetcher.fetch_attachment_content.assert_called_once_with(
+        "https://jira.example.com/att/3"
+    )
