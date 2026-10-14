@@ -397,6 +397,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
         get_board_issues,
         get_field_options,
         get_issue,
+        get_issue_documents,
         get_issue_images,
         get_link_types,
         get_project_components,
@@ -434,6 +435,7 @@ def test_jira_mcp(mock_jira_fetcher, mock_base_jira_config):
     jira_sub_mcp.add_tool(get_worklog)
     jira_sub_mcp.add_tool(download_attachments)
     jira_sub_mcp.add_tool(get_issue_images)
+    jira_sub_mcp.add_tool(get_issue_documents)
     jira_sub_mcp.add_tool(get_field_options)
     jira_sub_mcp.add_tool(get_agile_boards)
     jira_sub_mcp.add_tool(get_board_issues)
@@ -2469,3 +2471,123 @@ async def test_get_issue_images_filenames_filter(jira_client, mock_jira_fetcher)
     mock_jira_fetcher.fetch_attachment_content.assert_called_once_with(
         "https://jira.example.com/att/3"
     )
+
+
+# ── jira_get_issue_documents tests ───────────────────────────────────
+
+
+def _jira_doc_attachments():
+    from mcp_atlassian.models.jira import JiraAttachment
+
+    return [
+        JiraAttachment(
+            id="1",
+            filename="report.pdf",
+            size=1024,
+            content_type="application/pdf",
+            url="https://jira.example.com/att/1",
+            created="2026-10-01T10:00:00.000+0300",
+        ),
+        JiraAttachment(
+            id="2",
+            filename="slides.pptx",
+            size=2048,
+            content_type="application/octet-stream",
+            url="https://jira.example.com/att/2",
+            created="2026-10-02T10:00:00.000+0300",
+        ),
+        JiraAttachment(
+            id="3",
+            filename="photo.png",
+            size=100,
+            content_type="image/png",
+            url="https://jira.example.com/att/3",
+        ),
+    ]
+
+
+@pytest.mark.anyio
+async def test_get_issue_documents_converts_documents_only(
+    jira_client, mock_jira_fetcher, monkeypatch
+):
+    monkeypatch.setenv("DOCLING_URL", "http://docling:5001")
+    calls = []
+
+    async def fake_convert(data, filename, mime_type):
+        calls.append((filename, mime_type))
+        return f"| a | b |\n|---|---|\n| {filename} | 1 |"
+
+    monkeypatch.setattr("src.mcp_atlassian.servers.jira.convert_document", fake_convert)
+    mock_jira_fetcher.get_issue_attachments.return_value = _jira_doc_attachments()
+    mock_jira_fetcher.fetch_attachment_content.return_value = b"PK\x03\x04"
+
+    response = await jira_client.call_tool(
+        "jira_get_issue_documents", {"issue_key": "TEST-123"}
+    )
+
+    summary = json.loads(response.content[0].text)
+    assert summary["total_documents"] == 2
+    assert summary["converted"] == 2
+    # octet-stream pptx resolved by extension; the png is not a document
+    assert calls == [
+        ("report.pdf", "application/pdf"),
+        (
+            "slides.pptx",
+            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        ),
+    ]
+    assert response.content[1].type == "text"
+    assert response.content[1].text.startswith("## Attachment: report.pdf")
+    assert "| report.pdf | 1 |" in response.content[1].text
+
+
+@pytest.mark.anyio
+async def test_get_issue_documents_filenames_and_failures(
+    jira_client, mock_jira_fetcher, monkeypatch
+):
+    from mcp_atlassian.utils.documents import DocumentConversionError
+
+    monkeypatch.setenv("DOCLING_URL", "http://docling:5001")
+
+    async def failing_convert(data, filename, mime_type):
+        raise DocumentConversionError("docling HTTP 500: boom")
+
+    monkeypatch.setattr(
+        "src.mcp_atlassian.servers.jira.convert_document", failing_convert
+    )
+    mock_jira_fetcher.get_issue_attachments.return_value = _jira_doc_attachments()
+    mock_jira_fetcher.fetch_attachment_content.return_value = b"%PDF"
+
+    response = await jira_client.call_tool(
+        "jira_get_issue_documents",
+        {"issue_key": "TEST-123", "filenames": "REPORT.pdf, missing.docx"},
+    )
+
+    summary = json.loads(response.content[0].text)
+    assert len(response.content) == 1
+    assert summary["converted"] == 0
+    assert summary["failed"][0]["filename"] == "report.pdf"
+    assert "boom" in summary["failed"][0]["error"]
+    assert summary["not_found"] == ["missing.docx"]
+    assert [a["filename"] for a in summary["available"]] == [
+        "slides.pptx",
+        "report.pdf",
+    ]
+
+
+@pytest.mark.anyio
+async def test_get_issue_documents_without_docling(
+    jira_client, mock_jira_fetcher, monkeypatch
+):
+    monkeypatch.delenv("DOCLING_URL", raising=False)
+    mock_jira_fetcher.get_issue_attachments.return_value = _jira_doc_attachments()
+
+    response = await jira_client.call_tool(
+        "jira_get_issue_documents", {"issue_key": "TEST-123"}
+    )
+
+    summary = json.loads(response.content[0].text)
+    assert summary["success"] is False
+    assert "DOCLING_URL" in summary["error"]
+    assert summary["available"] == ["report.pdf", "slides.pptx"]
+    mock_jira_fetcher.fetch_attachment_content.assert_not_called()

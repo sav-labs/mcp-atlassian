@@ -1,5 +1,6 @@
 """Jira FastMCP server instance and tool definitions."""
 
+import asyncio
 import base64
 import json
 import logging
@@ -17,6 +18,14 @@ from mcp_atlassian.models.jira import JiraAttachment
 from mcp_atlassian.models.jira.common import JiraUser
 from mcp_atlassian.servers.dependencies import get_jira_fetcher
 from mcp_atlassian.utils.decorators import check_write_access
+from mcp_atlassian.utils.documents import (
+    DocumentConversionError,
+    convert_document,
+    docling_url,
+    document_text,
+    gather_limited,
+    is_document_attachment,
+)
 from mcp_atlassian.utils.media import (
     ATTACHMENT_MAX_BYTES,
     fetch_and_encode_attachment,
@@ -1062,6 +1071,155 @@ async def get_issue_images(
         TextContent(
             type="text",
             text=json.dumps(summary, indent=2, ensure_ascii=False),
+        ),
+    )
+    return contents
+
+
+@jira_mcp.tool(
+    tags={"jira", "read", "attachments", "toolset:jira_attachments"},
+    annotations={"title": "Get Issue Documents", "readOnlyHint": True},
+)
+async def get_issue_documents(
+    ctx: Context,
+    issue_key: Annotated[
+        str,
+        Field(
+            description="Jira issue key (e.g., 'PROJ-123', 'ACV2-642')",
+            pattern=ISSUE_KEY_PATTERN,
+        ),
+    ],
+    filenames: Annotated[
+        str | None,
+        Field(
+            description=(
+                "(Optional) Comma-separated document filenames to read "
+                "(e.g., 'report.pdf,slides.pptx'). Case-insensitive exact "
+                "match. Omit to read all documents. Get names via "
+                "jira_get_issue with fields='attachment'."
+            ),
+        ),
+    ] = None,
+) -> list[TextContent]:
+    """Read document attachments of a Jira issue as markdown text.
+
+    Converts PDF, DOCX, PPTX, XLSX and HTML attachments to markdown
+    (tables preserved, scans OCR'd) via docling-serve, so models that
+    accept only text can read them. Pictures inside documents are not
+    included. Other attachment types are excluded (images: use
+    jira_get_issue_images).
+
+    With ``filenames`` only the named documents are converted. Requested
+    names that match nothing are listed in ``not_found`` together with
+    ``available`` document names (newest first) so the caller can retry.
+
+    Args:
+        ctx: The FastMCP context.
+        issue_key: Jira issue key.
+        filenames: Optional comma-separated filename filter.
+
+    Returns:
+        A list with a JSON summary followed by one markdown text per
+        successfully converted document.
+    """
+    jira = await get_jira_fetcher(ctx)
+    contents: list[TextContent] = []
+
+    documents: list[tuple[JiraAttachment, str]] = []
+    for att in jira.get_issue_attachments(issue_key):
+        is_doc, resolved_mime = is_document_attachment(att.content_type, att.filename)
+        if is_doc:
+            documents.append((att, resolved_mime))
+
+    summary: dict[str, object] = {
+        "success": True,
+        "issue_key": issue_key,
+        "total_documents": len(documents),
+    }
+    if not documents:
+        summary.update(converted=0, failed=[], message="No document attachments found")
+        return [
+            TextContent(
+                type="text", text=json.dumps(summary, indent=2, ensure_ascii=False)
+            )
+        ]
+    if not docling_url():
+        summary.update(
+            success=False,
+            error="Document conversion is not configured on this server (DOCLING_URL).",
+            available=[att.filename for att, _ in documents],
+        )
+        return [
+            TextContent(
+                type="text", text=json.dumps(summary, indent=2, ensure_ascii=False)
+            )
+        ]
+
+    selected, not_found = select_by_filenames(
+        documents, lambda a: a.filename, parse_filenames(filenames)
+    )
+
+    async def read_one(
+        item: tuple[JiraAttachment, str],
+    ) -> tuple[dict[str, object], str | None]:
+        """Fetch and convert one document: (summary entry, markdown or None)."""
+        att, resolved_mime = item
+        filename = att.filename or "unknown"
+
+        if att.size > ATTACHMENT_MAX_BYTES:
+            return {
+                "filename": filename,
+                "error": f"Document is {att.size} bytes which exceeds the 50 MB limit.",
+            }, None
+        if not att.url:
+            return {"filename": filename, "error": "No download URL"}, None
+
+        try:
+            # Sync HTTP client: off the event loop so downloads overlap too.
+            data_bytes = await asyncio.to_thread(jira.fetch_attachment_content, att.url)
+        except Exception as e:
+            logger.warning("Failed to fetch attachment '%s': %s", filename, e)
+            data_bytes = None
+        if data_bytes is None:
+            return {"filename": filename, "error": "Fetch failed"}, None
+
+        try:
+            markdown = await convert_document(data_bytes, filename, resolved_mime)
+        except DocumentConversionError as e:
+            logger.warning("Failed to convert attachment '%s': %s", filename, e)
+            return {"filename": filename, "error": f"Conversion failed: {e}"}, None
+        return {
+            "filename": filename,
+            "size": len(data_bytes),
+            "chars": len(markdown),
+        }, markdown
+
+    converted: list[dict[str, object]] = []
+    failed: list[dict[str, object]] = []
+    for entry, markdown in await gather_limited(selected, read_one):
+        if markdown is None:
+            failed.append(entry)
+            continue
+        converted.append(entry)
+        contents.append(
+            TextContent(
+                type="text", text=document_text(str(entry["filename"]), markdown)
+            )
+        )
+
+    summary.update(converted=len(converted), documents=converted, failed=failed)
+    if not_found:
+        summary["not_found"] = not_found
+        summary["available"] = [
+            {"filename": att.filename, "created": att.created}
+            for att, _ in sorted(
+                documents, key=lambda item: item[0].created, reverse=True
+            )
+        ]
+    contents.insert(
+        0,
+        TextContent(
+            type="text", text=json.dumps(summary, indent=2, ensure_ascii=False)
         ),
     )
     return contents

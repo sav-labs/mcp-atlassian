@@ -199,6 +199,7 @@ def test_confluence_mcp(mock_confluence_fetcher, mock_base_confluence_config):
         get_labels,
         get_page,
         get_page_children,
+        get_page_documents,
         get_page_images,
         get_space_page_tree,
         search,
@@ -244,6 +245,7 @@ def test_confluence_mcp(mock_confluence_fetcher, mock_base_confluence_config):
     confluence_sub_mcp.add_tool(download_content_attachments)
     confluence_sub_mcp.add_tool(delete_attachment)
     confluence_sub_mcp.add_tool(get_page_images)
+    confluence_sub_mcp.add_tool(get_page_documents)
 
     test_mcp.mount(confluence_sub_mcp, prefix="confluence")
 
@@ -268,6 +270,7 @@ def no_fetcher_test_confluence_mcp(mock_base_confluence_config):
         get_labels,
         get_page,
         get_page_children,
+        get_page_documents,
         get_page_images,
         get_space_page_tree,
         search,
@@ -315,6 +318,7 @@ def no_fetcher_test_confluence_mcp(mock_base_confluence_config):
     confluence_sub_mcp.add_tool(download_content_attachments)
     confluence_sub_mcp.add_tool(delete_attachment)
     confluence_sub_mcp.add_tool(get_page_images)
+    confluence_sub_mcp.add_tool(get_page_documents)
 
     test_mcp.mount(confluence_sub_mcp, prefix="confluence")
 
@@ -998,3 +1002,85 @@ async def test_get_page_images_filenames_filter(client, mock_confluence_fetcher)
     assert "not_found" not in summary
     assert len(response.content) == 2
     assert mock_confluence_fetcher.fetch_attachment_content.call_count == 1
+
+
+# --- get_page_documents tool tests ---
+
+
+@pytest.mark.anyio
+async def test_get_page_documents(client, mock_confluence_fetcher, monkeypatch):
+    monkeypatch.setenv("DOCLING_URL", "http://docling:5001")
+    calls = []
+
+    async def fake_convert(data, filename, mime_type):
+        calls.append(filename)
+        return "# Slide 1\n\nControl word: AGAT"
+
+    monkeypatch.setattr(
+        "src.mcp_atlassian.servers.confluence.convert_document", fake_convert
+    )
+    mock_confluence_fetcher.get_content_attachments.return_value = {
+        "success": True,
+        "content_id": "123",
+        "attachments": [
+            {
+                "id": "att1",
+                "title": "slides.pptx",
+                "type": "attachment",
+                "metadata": {"mediaType": "application/octet-stream"},
+                "extensions": {
+                    "mediaType": "application/octet-stream",
+                    "fileSize": 2048,
+                },
+                "_links": {"download": "/download/attachments/123/slides.pptx"},
+            },
+            {
+                "id": "att2",
+                "title": "photo.png",
+                "type": "attachment",
+                "metadata": {"mediaType": "image/png"},
+                "extensions": {"mediaType": "image/png", "fileSize": 100},
+                "_links": {"download": "/download/attachments/123/photo.png"},
+            },
+        ],
+    }
+    mock_confluence_fetcher.fetch_attachment_content.return_value = b"PK\x03\x04"
+
+    response = await client.call_tool(
+        "confluence_get_page_documents",
+        {"content_id": "123", "filenames": "slides.PPTX"},
+    )
+
+    summary = json.loads(response.content[0].text)
+    assert summary["total_documents"] == 1
+    assert summary["converted"] == 1
+    assert calls == ["slides.pptx"]
+    assert "Control word: AGAT" in response.content[1].text
+
+
+@pytest.mark.anyio
+async def test_get_page_documents_without_docling(
+    client, mock_confluence_fetcher, monkeypatch
+):
+    monkeypatch.delenv("DOCLING_URL", raising=False)
+    mock_confluence_fetcher.get_content_attachments.return_value = {
+        "success": True,
+        "content_id": "123",
+        "attachments": [
+            {
+                "id": "att1",
+                "title": "report.pdf",
+                "type": "attachment",
+                "extensions": {"mediaType": "application/pdf", "fileSize": 10},
+                "_links": {"download": "/download/attachments/123/report.pdf"},
+            }
+        ],
+    }
+
+    response = await client.call_tool(
+        "confluence_get_page_documents", {"content_id": "123"}
+    )
+
+    summary = json.loads(response.content[0].text)
+    assert summary["success"] is False
+    assert summary["available"] == ["report.pdf"]

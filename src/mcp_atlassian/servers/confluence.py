@@ -1,5 +1,6 @@
 """Confluence FastMCP server instance and tool definitions."""
 
+import asyncio
 import base64
 import json
 import logging
@@ -15,6 +16,14 @@ from mcp_atlassian.models.confluence import ConfluenceAttachment
 from mcp_atlassian.servers.dependencies import get_confluence_fetcher
 from mcp_atlassian.utils.decorators import (
     check_write_access,
+)
+from mcp_atlassian.utils.documents import (
+    DocumentConversionError,
+    convert_document,
+    docling_url,
+    document_text,
+    gather_limited,
+    is_document_attachment,
 )
 from mcp_atlassian.utils.media import (
     ATTACHMENT_MAX_BYTES,
@@ -2100,6 +2109,189 @@ async def get_page_images(
         TextContent(
             type="text",
             text=json.dumps(summary, indent=2, ensure_ascii=False),
+        ),
+    )
+    return contents
+
+
+@confluence_mcp.tool(
+    tags={"confluence", "read", "attachments", "toolset:confluence_attachments"},
+    annotations={"title": "Get Page Documents", "readOnlyHint": True},
+)
+async def get_page_documents(
+    ctx: Context,
+    content_id: Annotated[
+        str,
+        Field(
+            description=(
+                "The ID of the Confluence page or blog post to read "
+                "documents from. Example: '123456789'"
+            )
+        ),
+    ],
+    filenames: Annotated[
+        str | None,
+        Field(
+            description=(
+                "(Optional) Comma-separated document filenames to read "
+                "(e.g., 'report.pdf,slides.pptx'). Case-insensitive exact "
+                "match. Omit to read all documents. Get names via "
+                "confluence_get_attachments."
+            ),
+        ),
+    ] = None,
+) -> list[TextContent]:
+    """Read document attachments of a Confluence page as markdown text.
+
+    Converts PDF, DOCX, PPTX, XLSX and HTML attachments to markdown
+    (tables preserved, scans OCR'd) via docling-serve, so models that
+    accept only text can read them. Pictures inside documents are not
+    included. Other attachment types are excluded (images: use
+    confluence_get_page_images).
+
+    With ``filenames`` only the named documents are converted. Requested
+    names that match nothing are listed in ``not_found`` together with
+    ``available`` document names so the caller can retry.
+
+    Args:
+        ctx: The FastMCP context.
+        content_id: The ID of the content.
+        filenames: Optional comma-separated filename filter.
+
+    Returns:
+        A list with a JSON summary followed by one markdown text per
+        successfully converted document.
+    """
+    confluence_fetcher = await get_confluence_fetcher(ctx)
+
+    attachments_result = confluence_fetcher.get_content_attachments(content_id)
+    if not attachments_result.get("success"):
+        return [
+            TextContent(
+                type="text",
+                text=json.dumps(attachments_result, indent=2, ensure_ascii=False),
+            )
+        ]
+
+    documents: list[tuple[dict[str, object], str]] = []
+    for att_dict in attachments_result.get("attachments", []):
+        if not isinstance(att_dict, dict):
+            continue
+        media_type = att_dict.get("extensions", {}).get("mediaType") or att_dict.get(
+            "metadata", {}
+        ).get("mediaType")
+        is_doc, resolved_mime = is_document_attachment(
+            media_type, att_dict.get("title")
+        )
+        if is_doc:
+            documents.append((att_dict, resolved_mime))
+
+    summary: dict[str, object] = {
+        "success": True,
+        "content_id": content_id,
+        "total_documents": len(documents),
+    }
+    if not documents:
+        summary.update(converted=0, failed=[], message="No document attachments found")
+        return [
+            TextContent(
+                type="text", text=json.dumps(summary, indent=2, ensure_ascii=False)
+            )
+        ]
+    if not docling_url():
+        summary.update(
+            success=False,
+            error="Document conversion is not configured on this server (DOCLING_URL).",
+            available=[att.get("title") for att, _ in documents],
+        )
+        return [
+            TextContent(
+                type="text", text=json.dumps(summary, indent=2, ensure_ascii=False)
+            )
+        ]
+
+    selected, not_found = select_by_filenames(
+        documents,
+        lambda a: a.get("title") if isinstance(a.get("title"), str) else None,
+        parse_filenames(filenames),
+    )
+
+    async def read_one(
+        item: tuple[dict, str],
+    ) -> tuple[dict[str, object], str | None]:
+        """Fetch and convert one document: (summary entry, markdown or None)."""
+        att_dict, resolved_mime = item
+        attachment = ConfluenceAttachment.from_api_response(att_dict)
+        filename = attachment.title or "unknown"
+
+        if (
+            attachment.file_size is not None
+            and attachment.file_size > ATTACHMENT_MAX_BYTES
+        ):
+            return {
+                "filename": filename,
+                "error": (
+                    f"Document is {attachment.file_size} bytes "
+                    "which exceeds the 50 MB limit."
+                ),
+            }, None
+        if not attachment.download_url:
+            return {"filename": filename, "error": "No download URL"}, None
+
+        download_url = resolve_relative_url(
+            attachment.download_url, confluence_fetcher.config.url
+        )
+        try:
+            # Sync HTTP client: off the event loop so downloads overlap too.
+            data_bytes = await asyncio.to_thread(
+                confluence_fetcher.fetch_attachment_content, download_url
+            )
+        except Exception as e:
+            logger.warning("Failed to fetch attachment '%s': %s", filename, e)
+            data_bytes = None
+        if data_bytes is None:
+            return {"filename": filename, "error": "Fetch failed"}, None
+        if len(data_bytes) > ATTACHMENT_MAX_BYTES:
+            return {
+                "filename": filename,
+                "error": (
+                    f"Downloaded size {len(data_bytes)} bytes exceeds the 50 MB limit."
+                ),
+            }, None
+
+        try:
+            markdown = await convert_document(data_bytes, filename, resolved_mime)
+        except DocumentConversionError as e:
+            logger.warning("Failed to convert attachment '%s': %s", filename, e)
+            return {"filename": filename, "error": f"Conversion failed: {e}"}, None
+        return {
+            "filename": filename,
+            "size": len(data_bytes),
+            "chars": len(markdown),
+        }, markdown
+
+    contents: list[TextContent] = []
+    converted: list[dict[str, object]] = []
+    failed: list[dict[str, object]] = []
+    for entry, markdown in await gather_limited(selected, read_one):
+        if markdown is None:
+            failed.append(entry)
+            continue
+        converted.append(entry)
+        contents.append(
+            TextContent(
+                type="text", text=document_text(str(entry["filename"]), markdown)
+            )
+        )
+
+    summary.update(converted=len(converted), documents=converted, failed=failed)
+    if not_found:
+        summary["not_found"] = not_found
+        summary["available"] = [att.get("title") for att, _ in documents]
+    contents.insert(
+        0,
+        TextContent(
+            type="text", text=json.dumps(summary, indent=2, ensure_ascii=False)
         ),
     )
     return contents
