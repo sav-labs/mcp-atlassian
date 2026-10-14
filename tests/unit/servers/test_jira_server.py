@@ -1044,8 +1044,8 @@ async def test_get_all_projects_tool(jira_client, mock_jira_fetcher):
     ]
     # Reset the mock and set specific return value for this test
     mock_jira_fetcher.get_all_projects.reset_mock()
-    mock_jira_fetcher.get_all_projects.side_effect = (
-        lambda include_archived=False: mock_projects
+    mock_jira_fetcher.get_all_projects.side_effect = lambda include_archived=False: (
+        mock_projects
     )
 
     # Test with default parameters (include_archived=False)
@@ -1093,8 +1093,8 @@ async def test_get_all_projects_tool_with_archived(jira_client, mock_jira_fetche
     ]
     # Reset the mock and set specific return value for this test
     mock_jira_fetcher.get_all_projects.reset_mock()
-    mock_jira_fetcher.get_all_projects.side_effect = (
-        lambda include_archived=False: mock_projects
+    mock_jira_fetcher.get_all_projects.side_effect = lambda include_archived=False: (
+        mock_projects
     )
 
     # Test with include_archived=True
@@ -1147,8 +1147,8 @@ async def test_get_all_projects_tool_with_projects_filter(
 
     # Set up the mock to return all projects
     mock_jira_fetcher.get_all_projects.reset_mock()
-    mock_jira_fetcher.get_all_projects.side_effect = (
-        lambda include_archived=False: all_mock_projects
+    mock_jira_fetcher.get_all_projects.side_effect = lambda include_archived=False: (
+        all_mock_projects
     )
 
     # Set up the projects filter in the config
@@ -1201,8 +1201,8 @@ async def test_get_all_projects_tool_no_projects_filter(jira_client, mock_jira_f
 
     # Set up the mock to return all projects
     mock_jira_fetcher.get_all_projects.reset_mock()
-    mock_jira_fetcher.get_all_projects.side_effect = (
-        lambda include_archived=False: all_mock_projects
+    mock_jira_fetcher.get_all_projects.side_effect = lambda include_archived=False: (
+        all_mock_projects
     )
 
     # Ensure no projects filter is set
@@ -1262,8 +1262,8 @@ async def test_get_all_projects_tool_case_insensitive_filter(
 
     # Set up the mock to return all projects
     mock_jira_fetcher.get_all_projects.reset_mock()
-    mock_jira_fetcher.get_all_projects.side_effect = (
-        lambda include_archived=False: all_mock_projects
+    mock_jira_fetcher.get_all_projects.side_effect = lambda include_archived=False: (
+        all_mock_projects
     )
 
     # Set up projects filter with mixed case and whitespace
@@ -1878,6 +1878,47 @@ async def test_get_issue_images_basic(jira_client, mock_jira_fetcher):
     assert summary["downloaded"] == 1
     assert response.content[1].type == "image"
     assert response.content[1].mimeType == "image/png"
+
+
+@pytest.mark.anyio
+async def test_get_issue_images_budget(jira_client, mock_jira_fetcher, monkeypatch):
+    """AIM fork: with IMAGE_BUDGET_BYTES images are shrunk to share it."""
+    import base64
+    import io
+
+    from PIL import Image, ImageFilter
+
+    from mcp_atlassian.models.jira import JiraAttachment
+
+    monkeypatch.setenv("IMAGE_BUDGET_BYTES", "60000")
+    noise = Image.merge("RGB", [Image.effect_noise((1600, 900), 90) for _ in range(3)])
+    buf = io.BytesIO()
+    noise.filter(ImageFilter.GaussianBlur(2)).save(buf, "PNG")
+    heavy = buf.getvalue()
+    assert len(heavy) > 60000
+
+    mock_jira_fetcher.get_issue_attachments.return_value = [
+        JiraAttachment(
+            id=str(i),
+            filename=f"shot-{i}.png",
+            size=len(heavy),
+            content_type="image/png",
+            url=f"https://jira.example.com/att/{i}",
+        )
+        for i in range(2)
+    ]
+    mock_jira_fetcher.fetch_attachment_content.return_value = heavy
+
+    response = await jira_client.call_tool(
+        "jira_get_issue_images", {"issue_key": "TEST-123"}
+    )
+
+    summary = json.loads(response.content[0].text)
+    assert summary["downloaded"] == 2
+    assert [i["filename"] for i in summary["images"]] == ["shot-0.png", "shot-1.png"]
+    sizes = [len(base64.b64decode(c.data)) for c in response.content[1:]]
+    assert len(sizes) == 2
+    assert all(size <= 30000 for size in sizes)
 
 
 @pytest.mark.anyio

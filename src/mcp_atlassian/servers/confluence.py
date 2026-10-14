@@ -25,6 +25,7 @@ from mcp_atlassian.utils.documents import (
     gather_limited,
     is_document_attachment,
 )
+from mcp_atlassian.utils.images import fit_images, image_budget
 from mcp_atlassian.utils.media import (
     ATTACHMENT_MAX_BYTES,
     fetch_and_encode_attachment,
@@ -2041,6 +2042,7 @@ async def get_page_images(
 
     fetched: list[dict[str, object]] = []
     failed: list[dict[str, object]] = []
+    collected: list[tuple[str, str, str]] = []
 
     for att_dict, resolved_mime in selected:
         attachment = ConfluenceAttachment.from_api_response(att_dict)
@@ -2086,21 +2088,26 @@ async def get_page_images(
             continue
 
         fetched.append({"filename": filename, "size": fetched_bytes})
-        contents.append(
-            ImageContent(
-                type="image",
-                data=encoded,
-                mimeType=resolved_mime,
-            )
-        )
+        collected.append((filename, encoded, resolved_mime))
+
+    # AIM fork: shrink to the chat's tool-result budget (IMAGE_BUDGET_BYTES).
+    kept, skipped = await asyncio.to_thread(fit_images, collected)
+    failed.extend(skipped)
+    for _, data, mime, _ in kept:
+        contents.append(ImageContent(type="image", data=data, mimeType=mime))
 
     summary: dict[str, object] = {
         "success": True,
         "content_id": content_id,
         "total_images": len(image_attachments),
-        "downloaded": len(fetched),
+        "downloaded": len(kept),
         "failed": failed,
     }
+    if image_budget():
+        # Images below follow this order; the model cannot see file names.
+        summary["images"] = [
+            {"filename": name, "shown": note} for name, _, _, note in kept
+        ]
     if not_found:
         summary["not_found"] = not_found
         summary["available"] = [att.get("title") for att, _ in image_attachments]
